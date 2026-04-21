@@ -103,6 +103,8 @@ class KNNSearchMulti:
             gpu_index = faiss.index_cpu_to_gpu(faiss.StandardGpuResources(), gpu_id, cpu_index, co)
             
             logger.info(f"Process {self.process_index}: Moved index to all GPU with shard")
+        else:
+            gpu_index = cpu_index
         
         cpu_index.make_direct_map()
         

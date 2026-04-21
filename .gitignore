@@ -211,3 +211,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+# Personalized
+
+vlm_dstore/
+vlm_memdec_checkpoints/final
+vlm_memdec_data/
