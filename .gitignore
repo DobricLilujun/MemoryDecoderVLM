@@ -216,5 +216,16 @@ __marimo__/
 # Personalized
 
 vlm_dstore/
-vlm_memdec_checkpoints/final
+vlm_memdec_checkpoints/
 vlm_memdec_data/
+
+# Model checkpoints and generated data (zoom_decoder experiments)
+zoom_decoder/ckpt/
+zoom_decoder/ckpt_test/
+zoom_decoder/dstore/
+zoom_decoder/dstore_knn/
+zoom_decoder/dstore_priv/
+zoom_decoder/dstore_test/
+zoom_decoder/dstore_zoom_priv/
+zoom_decoder/eval/
+zoom_decoder/eval_test/
