@@ -26,22 +26,37 @@ from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader, Dataset as TorchDataset
 from tqdm import tqdm
 from transformers import (
+    AutoConfig,
     AutoProcessor,
     Qwen2VLForConditionalGeneration,
     get_linear_schedule_with_warmup,
 )
 
 
+def _load_vlm_auto(model_id: str, dtype):
+    """Load the correct VLM class based on model_type in config."""
+    model_type = AutoConfig.from_pretrained(model_id).model_type
+    if model_type == "qwen2_vl":
+        from transformers import Qwen2VLForConditionalGeneration as _Cls
+    elif model_type == "qwen3_vl":
+        from transformers import Qwen3VLForConditionalGeneration as _Cls
+    else:
+        raise ValueError(f"Unsupported VLM model_type '{model_type}'. Add it to _load_vlm_auto.")
+    return _Cls.from_pretrained(model_id, dtype=dtype)
+
+
 class FSBLoRAItem(TorchDataset):
-    def __init__(self, hf_ds, indices):
-        self.ds = hf_ds
-        self.idx = list(indices)
+    """Indexes a list of (split_name, sample_idx) pairs across multiple HF subsets."""
+    def __init__(self, ds_by_split, plan):
+        self.ds_by_split = ds_by_split
+        self.plan = list(plan)
 
     def __len__(self):
-        return len(self.idx)
+        return len(self.plan)
 
     def __getitem__(self, i):
-        return self.ds[int(self.idx[i])]
+        split_name, s_idx = self.plan[i]
+        return self.ds_by_split[split_name][int(s_idx)]
 
 
 def make_collate(processor, tokenizer):
@@ -98,8 +113,12 @@ def make_collate(processor, tokenizer):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--vlm_model", default="Qwen/Qwen2-VL-2B-Instruct")
-    p.add_argument("--split", default="perception")
-    p.add_argument("--splits_file", required=True)
+    p.add_argument(
+        "--train_splits", nargs="+", default=["perception", "reasoning"],
+        choices=["perception", "reasoning"],
+    )
+    p.add_argument("--splits_file", required=True,
+                   help="V4 splits.json (output of zoom_decoder.make_splits).")
     p.add_argument("--out_dir", required=True)
     p.add_argument("--epochs", type=int, default=2)
     p.add_argument("--batch_size", type=int, default=2)
@@ -111,6 +130,7 @@ def main():
     p.add_argument("--lora_alpha", type=int, default=32)
     p.add_argument("--lora_dropout", type=float, default=0.05)
     p.add_argument("--max_train", type=int, default=-1)
+    p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda")
     args = p.parse_args()
 
@@ -119,17 +139,27 @@ def main():
     device = torch.device(args.device)
 
     splits = json.loads(Path(args.splits_file).read_text())
-    train_idx = splits["train"]
-    if args.max_train > 0:
-        train_idx = train_idx[: args.max_train]
+    if splits.get("version") != "v4":
+        raise ValueError(f"{args.splits_file} is not a V4 splits.json")
 
-    logger.info("Loading FineSightBench {}", args.split)
-    ds = load_dataset("Volavion/FineSightBench")[args.split]
-    logger.info("Train samples: {}", len(train_idx))
+    ds_by_split = {}
+    plan = []
+    for split_name in args.train_splits:
+        if split_name not in splits:
+            raise ValueError(f"split '{split_name}' not in splits_file")
+        logger.info("Loading FineSightBench {}", split_name)
+        ds_by_split[split_name] = load_dataset("Volavion/FineSightBench")[split_name]
+        for s_idx in splits[split_name]["train"]:
+            plan.append((split_name, int(s_idx)))
+    import random as _r
+    _r.Random(args.seed).shuffle(plan)
+    if args.max_train > 0:
+        plan = plan[: args.max_train]
+    logger.info("Combined LoRA train pool size = {}", len(plan))
 
     processor = AutoProcessor.from_pretrained(args.vlm_model)
     tokenizer = processor.tokenizer
-    model = Qwen2VLForConditionalGeneration.from_pretrained(args.vlm_model, dtype=torch.bfloat16)
+    model = _load_vlm_auto(args.vlm_model, torch.bfloat16)
     model.gradient_checkpointing_enable()
 
     lora_cfg = LoraConfig(
@@ -144,7 +174,7 @@ def main():
     model.print_trainable_parameters()
     model.to(device)
 
-    torch_ds = FSBLoRAItem(ds, train_idx)
+    torch_ds = FSBLoRAItem(ds_by_split, plan)
     loader = DataLoader(
         torch_ds, batch_size=args.batch_size, shuffle=True,
         collate_fn=make_collate(processor, tokenizer),

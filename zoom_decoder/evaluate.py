@@ -41,7 +41,19 @@ from datasets import load_dataset
 from loguru import logger
 from peft import PeftModel
 from tqdm import tqdm
-from transformers import AutoProcessor, AutoTokenizer, Qwen2VLForConditionalGeneration
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer, Qwen2VLForConditionalGeneration
+
+
+def _load_vlm_auto(model_id: str, dtype):
+    """Load the correct VLM class based on model_type in config."""
+    model_type = AutoConfig.from_pretrained(model_id).model_type
+    if model_type == "qwen2_vl":
+        from transformers import Qwen2VLForConditionalGeneration as _Cls
+    elif model_type == "qwen3_vl":
+        from transformers import Qwen3VLForConditionalGeneration as _Cls
+    else:
+        raise ValueError(f"Unsupported VLM model_type '{model_type}'. Add it to _load_vlm_auto.")
+    return _Cls.from_pretrained(model_id, dtype=dtype)
 
 from zoom_decoder.data_utils import parse_targets, min_target_size, size_to_bucket_idx, SIZE_BUCKETS
 from zoom_decoder.model import ZoomDecoder
@@ -191,14 +203,19 @@ def generate_zoom_joint(
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["base", "zoom", "lora"], required=True)
-    p.add_argument("--split", default="perception")
-    p.add_argument("--splits_file", required=True)
-    p.add_argument("--eval_split", default="test", choices=["val", "test"])
+    p.add_argument("--splits_file", required=True,
+                   help="V4 splits.json (perception/reasoning sub-keys with train/val).")
+    p.add_argument(
+        "--eval_splits", nargs="+", default=["perception", "reasoning"],
+        choices=["perception", "reasoning"],
+        help="Which val sets to score on. Each gets its own summary block.",
+    )
     p.add_argument("--vlm_model", default="Qwen/Qwen2-VL-2B-Instruct")
     p.add_argument("--zoom_ckpt", default=None)
     p.add_argument("--lora_ckpt", default=None)
     p.add_argument("--lmbda", type=float, default=0.35)
-    p.add_argument("--max_samples", type=int, default=-1)
+    p.add_argument("--max_samples", type=int, default=-1,
+                   help="Cap PER eval split (not total).")
     p.add_argument("--max_new_tokens", type=int, default=48)
     p.add_argument("--out_file", required=True)
     p.add_argument("--device", default="cuda")
@@ -206,15 +223,19 @@ def main():
 
     device = torch.device(args.device)
     splits = json.loads(Path(args.splits_file).read_text())
-    indices = splits[args.eval_split]
-    if args.max_samples > 0:
-        indices = indices[: args.max_samples]
-    logger.info("Eval on {} samples", len(indices))
+    is_v4 = splits.get("version") == "v4"
+    if not is_v4:
+        # Back-compat: V3 schema {"train","val","test"} treated as a single
+        # "perception" split scored on "test".
+        logger.warning("splits_file is V3 schema; treating as single perception/test eval")
+        splits = {"version": "v4-compat",
+                  "perception": {"train": splits.get("train", []),
+                                 "val": splits.get("test", splits.get("val", []))}}
+        args.eval_splits = ["perception"]
 
-    ds = load_dataset("Volavion/FineSightBench")[args.split]
     processor = AutoProcessor.from_pretrained(args.vlm_model)
 
-    vlm = Qwen2VLForConditionalGeneration.from_pretrained(args.vlm_model, dtype=torch.bfloat16)
+    vlm = _load_vlm_auto(args.vlm_model, torch.bfloat16)
     if args.mode == "lora":
         assert args.lora_ckpt, "Need --lora_ckpt for lora mode"
         vlm = PeftModel.from_pretrained(vlm, args.lora_ckpt)
@@ -227,77 +248,96 @@ def main():
         zoom_dec = ZoomDecoder.load_from_dir(args.zoom_ckpt, dtype=torch.bfloat16).to(device).eval()
         tokenizer = AutoTokenizer.from_pretrained(args.vlm_model)
 
-    # Aggregate metrics by difficulty and task_type
-    correct_by_diff = defaultdict(lambda: [0, 0])  # [correct, total]
-    correct_by_task = defaultdict(lambda: [0, 0])
-    correct_by_size = defaultdict(lambda: [0, 0])
-    records = []
+    per_split_summary: Dict[str, dict] = {}
+    per_split_records: Dict[str, list] = {}
 
-    for idx in tqdm(indices, desc=args.mode):
-        s = ds[int(idx)]
-        image = s["image"].convert("RGB")
-        question = s["question"]
-        gt = s["answer"]
-        try:
-            targets = parse_targets(s["metadata"])
-        except Exception:
-            targets = []
-        px = min_target_size(targets) if targets else 48
-        size_b = size_to_bucket_idx(px)
+    for split_name in args.eval_splits:
+        if split_name not in splits or "val" not in splits[split_name]:
+            logger.warning("split '{}' not in splits_file; skipping", split_name)
+            continue
+        indices = list(splits[split_name]["val"])
+        if args.max_samples > 0:
+            indices = indices[: args.max_samples]
+        logger.info("Eval [{}] on {} samples", split_name, len(indices))
 
-        if args.mode in ("base", "lora"):
-            pred = generate_base(vlm, processor, image, question, max_new_tokens=args.max_new_tokens)
-        else:
-            pred = generate_zoom_joint(
-                vlm, processor, zoom_dec, tokenizer, image, question,
-                size_bucket=size_b, lmbda=args.lmbda,
-                max_new_tokens=args.max_new_tokens,
-            )
-        ok = is_correct(pred, gt)
+        ds = load_dataset("Volavion/FineSightBench")[split_name]
 
-        diff = s["difficulty"]
-        tt = s["task_type"]
-        correct_by_diff[diff][1] += 1
-        correct_by_diff[diff][0] += int(ok)
-        correct_by_task[tt][1] += 1
-        correct_by_task[tt][0] += int(ok)
-        correct_by_size[px][1] += 1
-        correct_by_size[px][0] += int(ok)
-        records.append({
-            "idx": int(idx), "task": tt, "difficulty": diff, "pixel_size": px,
-            "gt": gt, "pred": pred, "correct": bool(ok),
-        })
+        correct_by_diff = defaultdict(lambda: [0, 0])
+        correct_by_task = defaultdict(lambda: [0, 0])
+        correct_by_size = defaultdict(lambda: [0, 0])
+        records = []
 
-    total_correct = sum(c for c, _ in correct_by_diff.values())
-    total_all = sum(t for _, t in correct_by_diff.values())
+        for idx in tqdm(indices, desc=f"{args.mode}/{split_name}"):
+            s = ds[int(idx)]
+            image = s["image"].convert("RGB")
+            question = s["question"]
+            gt = s["answer"]
+            try:
+                targets = parse_targets(s["metadata"])
+            except Exception:
+                targets = []
+            px = min_target_size(targets) if targets else 48
+            size_b = size_to_bucket_idx(px)
 
-    def pct(d):
-        return {k: {"acc": round(100 * v[0] / max(1, v[1]), 2), "n": v[1]}
-                for k, v in sorted(d.items())}
+            if args.mode in ("base", "lora"):
+                pred = generate_base(vlm, processor, image, question, max_new_tokens=args.max_new_tokens)
+            else:
+                pred = generate_zoom_joint(
+                    vlm, processor, zoom_dec, tokenizer, image, question,
+                    size_bucket=size_b, lmbda=args.lmbda,
+                    max_new_tokens=args.max_new_tokens,
+                )
+            ok = is_correct(pred, gt)
 
-    summary = {
-        "mode": args.mode,
-        "vlm": args.vlm_model,
-        "zoom_ckpt": args.zoom_ckpt,
-        "lora_ckpt": args.lora_ckpt,
-        "lmbda": args.lmbda if args.mode == "zoom" else None,
-        "overall_acc": round(100 * total_correct / max(1, total_all), 2),
-        "n": total_all,
-        "by_difficulty": pct(correct_by_diff),
-        "by_task": pct(correct_by_task),
-        "by_pixel_size": pct(correct_by_size),
-    }
+            diff = s["difficulty"]
+            tt = s["task_type"]
+            correct_by_diff[diff][1] += 1
+            correct_by_diff[diff][0] += int(ok)
+            correct_by_task[tt][1] += 1
+            correct_by_task[tt][0] += int(ok)
+            correct_by_size[px][1] += 1
+            correct_by_size[px][0] += int(ok)
+            records.append({
+                "idx": int(idx), "task": tt, "difficulty": diff, "pixel_size": px,
+                "gt": gt, "pred": pred, "correct": bool(ok),
+            })
+
+        total_correct = sum(c for c, _ in correct_by_diff.values())
+        total_all = sum(t for _, t in correct_by_diff.values())
+
+        def pct(d):
+            return {k: {"acc": round(100 * v[0] / max(1, v[1]), 2), "n": v[1]}
+                    for k, v in sorted(d.items())}
+
+        summary = {
+            "mode": args.mode,
+            "vlm": args.vlm_model,
+            "zoom_ckpt": args.zoom_ckpt,
+            "lora_ckpt": args.lora_ckpt,
+            "lmbda": args.lmbda if args.mode == "zoom" else None,
+            "eval_split": split_name,
+            "overall_acc": round(100 * total_correct / max(1, total_all), 2),
+            "n": total_all,
+            "by_difficulty": pct(correct_by_diff),
+            "by_task": pct(correct_by_task),
+            "by_pixel_size": pct(correct_by_size),
+        }
+        per_split_summary[split_name] = summary
+        per_split_records[split_name] = records
+
+        logger.success("[{}] Overall acc: {:.2f}%", split_name, summary["overall_acc"])
+        for k in ["extreme", "hard", "medium", "easy"]:
+            if k in summary["by_difficulty"]:
+                logger.info("  {}: {:.2f}%  (n={})",
+                            k, summary["by_difficulty"][k]["acc"],
+                            summary["by_difficulty"][k]["n"])
 
     Path(args.out_file).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out_file).write_text(json.dumps({
-        "summary": summary, "records": records,
+        "version": "v4",
+        "summary": per_split_summary,
+        "records": per_split_records,
     }, indent=2))
-    logger.success("Overall acc: {:.2f}%", summary["overall_acc"])
-    for k in ["extreme", "hard", "medium", "easy"]:
-        if k in summary["by_difficulty"]:
-            logger.info("  {}: {:.2f}%  (n={})",
-                        k, summary["by_difficulty"][k]["acc"],
-                        summary["by_difficulty"][k]["n"])
     logger.info("Saved → {}", args.out_file)
 
 

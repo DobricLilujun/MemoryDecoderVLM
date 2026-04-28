@@ -106,6 +106,7 @@ def stratified_split(
     val_per_cell: int = 15,
     test_per_cell: int = 15,
 ) -> Tuple[List[int], List[int], List[int]]:
+    """V3 three-way split (kept for backward compatibility)."""
     rng = random.Random(seed)
     by_cell: dict = {}
     for i, s in enumerate(dataset):
@@ -120,3 +121,25 @@ def stratified_split(
         train.extend(tr); val.extend(v); test.extend(te)
     rng.shuffle(train); rng.shuffle(val); rng.shuffle(test)
     return train, val, test
+
+
+def stratified_train_val_split(
+    dataset,
+    seed: int = 0,
+    train_per_cell: int = 70,
+    val_per_cell: int = 30,
+) -> Tuple[List[int], List[int]]:
+    """V4 two-way split: stratified by (task_type, difficulty), 70/30 by default."""
+    rng = random.Random(seed)
+    by_cell: dict = {}
+    for i, s in enumerate(dataset):
+        key = (s["task_type"], s["difficulty"])
+        by_cell.setdefault(key, []).append(i)
+    train, val = [], []
+    for key, idxs in by_cell.items():
+        rng.shuffle(idxs)
+        tr = idxs[:train_per_cell]
+        v = idxs[train_per_cell: train_per_cell + val_per_cell]
+        train.extend(tr); val.extend(v)
+    rng.shuffle(train); rng.shuffle(val)
+    return train, val

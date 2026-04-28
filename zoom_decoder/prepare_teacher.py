@@ -36,7 +36,19 @@ import torch.nn.functional as F
 from datasets import Dataset, load_dataset
 from loguru import logger
 from tqdm import tqdm
-from transformers import AutoProcessor, AutoTokenizer, Qwen2VLForConditionalGeneration
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer, Qwen2VLForConditionalGeneration
+
+
+def _load_vlm_auto(model_id: str, dtype):
+    """Load the correct VLM class based on model_type in config."""
+    model_type = AutoConfig.from_pretrained(model_id).model_type
+    if model_type == "qwen2_vl":
+        from transformers import Qwen2VLForConditionalGeneration as _Cls
+    elif model_type == "qwen3_vl":
+        from transformers import Qwen3VLForConditionalGeneration as _Cls
+    else:
+        raise ValueError(f"Unsupported VLM model_type '{model_type}'. Add it to _load_vlm_auto.")
+    return _Cls.from_pretrained(model_id, dtype=dtype)
 
 from zoom_decoder.data_utils import (
     SIZE_BUCKETS,
@@ -44,6 +56,7 @@ from zoom_decoder.data_utils import (
     parse_targets,
     size_to_bucket_idx,
     stratified_split,
+    stratified_train_val_split,
     union_bbox,
     zoom_crop,
 )
@@ -197,7 +210,17 @@ def build_decoder_inputs(tokenizer, question: str, answer: str) -> Dict:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--vlm_model", default="Qwen/Qwen2-VL-2B-Instruct")
-    p.add_argument("--split", default="perception", choices=["perception", "reasoning"])
+    p.add_argument(
+        "--splits", nargs="+", default=["perception"],
+        choices=["perception", "reasoning"],
+        help="Which FineSightBench split(s) to use for TEACHER prep. "
+             "V4 with-zoom group: perception only. V4 without-zoom group: both.",
+    )
+    p.add_argument(
+        "--splits_file", default=None,
+        help="Optional V4 splits.json (output of zoom_decoder.make_splits). "
+             "If given, train indices are loaded from it instead of regenerating.",
+    )
     p.add_argument("--out_dir", default="./zoom_decoder/dstore")
     p.add_argument("--topk", type=int, default=64)
     p.add_argument("--pad_ratio", type=float, default=2.5)
@@ -215,8 +238,7 @@ def main():
     p.add_argument("--max_samples", type=int, default=-1)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--train_per_cell", type=int, default=70)
-    p.add_argument("--val_per_cell", type=int, default=15)
-    p.add_argument("--test_per_cell", type=int, default=15)
+    p.add_argument("--val_per_cell", type=int, default=30)
     p.add_argument("--device", default="cuda")
     p.add_argument("--dtype", default="bfloat16")
     args = p.parse_args()
@@ -224,30 +246,64 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Loading FineSightBench split={}", args.split)
-    ds = load_dataset("Volavion/FineSightBench")[args.split]
-    logger.info("Dataset size: {}", len(ds))
+    # ------------------------------------------------------------------ #
+    # Build / load V4 splits.json                                        #
+    # ------------------------------------------------------------------ #
+    if args.splits_file is not None and Path(args.splits_file).exists():
+        logger.info("Loading existing splits from {}", args.splits_file)
+        splits_json = json.loads(Path(args.splits_file).read_text())
+        if splits_json.get("version") != "v4":
+            raise ValueError(f"{args.splits_file} is not a V4 splits.json")
+        for sp in args.splits:
+            if sp not in splits_json:
+                raise ValueError(f"split '{sp}' not present in {args.splits_file}")
+    else:
+        splits_json = {
+            "version": "v4", "seed": args.seed,
+            "train_per_cell": args.train_per_cell,
+            "val_per_cell": args.val_per_cell,
+        }
 
-    # Stratified split
-    train_idx, val_idx, test_idx = stratified_split(
-        ds,
-        seed=args.seed,
-        train_per_cell=args.train_per_cell,
-        val_per_cell=args.val_per_cell,
-        test_per_cell=args.test_per_cell,
-    )
-    logger.info("Splits → train={}, val={}, test={}", len(train_idx), len(val_idx), len(test_idx))
-    splits_json = {"train": train_idx, "val": val_idx, "test": test_idx}
-    (out_dir / "splits.json").write_text(json.dumps(splits_json))
+    # ------------------------------------------------------------------ #
+    # Load datasets and assemble combined training plan                  #
+    # ------------------------------------------------------------------ #
+    ds_by_split: Dict[str, "Dataset"] = {}
+    train_plan: List[tuple] = []  # list of (split_name, sample_idx)
+    for split_name in args.splits:
+        logger.info("Loading FineSightBench split={}", split_name)
+        ds_split = load_dataset("Volavion/FineSightBench")[split_name]
+        ds_by_split[split_name] = ds_split
+        if split_name in splits_json and "train" in splits_json[split_name]:
+            train_idx = list(splits_json[split_name]["train"])
+            val_idx = list(splits_json[split_name]["val"])
+        else:
+            train_idx, val_idx = stratified_train_val_split(
+                ds_split, seed=args.seed,
+                train_per_cell=args.train_per_cell,
+                val_per_cell=args.val_per_cell,
+            )
+            splits_json[split_name] = {"train": train_idx, "val": val_idx}
+        logger.info("  {}: train={} val={} (total={})",
+                    split_name, len(train_idx), len(val_idx), len(ds_split))
+        for s_idx in train_idx:
+            train_plan.append((split_name, int(s_idx)))
 
+    # Persist splits.json into out_dir for reproducibility
+    (out_dir / "splits.json").write_text(json.dumps(splits_json, indent=2))
+
+    # Shuffle the combined train plan with the same seed (deterministic)
+    import random as _r
+    _r.Random(args.seed).shuffle(train_plan)
     if args.max_samples > 0:
-        train_idx = train_idx[: args.max_samples]
-        logger.info("Truncated train → {}", len(train_idx))
+        train_plan = train_plan[: args.max_samples]
+        logger.info("Truncated combined train pool → {}", len(train_plan))
+    else:
+        logger.info("Combined train pool size = {}", len(train_plan))
 
     logger.info("Loading VLM: {}", args.vlm_model)
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
     device = torch.device(args.device)
-    vlm = Qwen2VLForConditionalGeneration.from_pretrained(args.vlm_model, dtype=dtype).to(device)
+    vlm = _load_vlm_auto(args.vlm_model, dtype).to(device)
     vlm.eval()
     processor = AutoProcessor.from_pretrained(args.vlm_model)
     # Use VLM's tokenizer for the decoder so IDs match
@@ -258,7 +314,8 @@ def main():
     running_offset = 0
     skipped = 0
 
-    for sample_idx in tqdm(train_idx, desc="zoom-teacher"):
+    for split_name, sample_idx in tqdm(train_plan, desc=f"teacher[{args.teacher_mode}]"):
+        ds = ds_by_split[split_name]
         s = ds[int(sample_idx)]
         image = s["image"].convert("RGB")
         question = s["question"]
@@ -345,6 +402,7 @@ def main():
                 "task_type": s["task_type"],
                 "difficulty": s["difficulty"],
                 "sample_idx": int(sample_idx),
+                "source_split": split_name,
             }
         )
         running_offset += n
@@ -367,7 +425,7 @@ def main():
         "skipped": skipped,
         "topk": args.topk,
         "vlm_model": args.vlm_model,
-        "split": args.split,
+        "splits": args.splits,
         "pad_ratio": args.pad_ratio,
         "teacher_mode": args.teacher_mode,
         "size_buckets": SIZE_BUCKETS,
